@@ -24,7 +24,7 @@ from provider import *
 from shapely.geometry import Polygon, MultiPolygon
 from Queue import Queue
 from sklearn.neighbors import KDTree
-
+from nms_rotate import nms_rotate_cpu
 
 def is_near(prop1, prop2):
     c1 = np.array(prop1.t)
@@ -79,7 +79,7 @@ class Sample(object):
 
 
 class FrustumDataset(object):
-    def __init__(self, npoints, kitti_path, batch_size, split, save_dir,
+    def __init__(self, npoints, kitti_path, batch_size, split, data_dir, is_training=False,
                  augmentX=1, random_shift=False, rotate_to_center=False, random_flip=False,
                  use_gt_prop=False):
         self.npoints = npoints
@@ -87,24 +87,22 @@ class FrustumDataset(object):
         self.random_flip = random_flip
         self.rotate_to_center = rotate_to_center
         self.kitti_path = kitti_path
-        self.kitti_dataset = kitti_object(kitti_path, 'training')
-        self.save_dir = save_dir
-        self.data_dir = os.path.join('./rcnn_data')
+        self.data_dir = data_dir
         self.split = split
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
         self.use_gt_prop = use_gt_prop
         #self.num_channel = 7
         self.num_channel = 4
-        # rpn_output_path = os.path.join(kitti_path, 'training/proposal_car_people')
-        # def is_prop_file(f):
-        #     return os.path.isfile(os.path.join(rpn_output_path, f)) and not '_roi' in f
-        # proposal_files = [f for f in os.listdir(rpn_output_path) if is_prop_file(f)]
-        # self.frame_ids = map(lambda x: x.replace('.txt', ''), proposal_files)
-        # self.frame_ids = list(set(self.load_split_ids(split)).intersection(self.frame_ids))
-        self.frame_ids = self.load_split_ids(split)
-        # self.frame_ids = self.frame_ids[:5]
-        random.shuffle(self.frame_ids)
+        self.is_training = is_training
+        if split in ['train', 'val']:
+            self.kitti_dataset = kitti_object(kitti_path, 'training')
+            self.frame_ids = self.load_split_ids(split)
+            random.shuffle(self.frame_ids)
+        else:
+            self.kitti_dataset = kitti_object_video(
+                os.path.join(kitti_path, 'image_02/data'),
+                os.path.join(kitti_path, 'velodyne_points/data'),
+                kitti_path)
+            self.frame_ids = map(lambda x: '{:06}'.format(x), range(self.kitti_dataset.num_samples))
         self.cur_batch = -1
         self.load_progress = 0
         self.batch_size = batch_size
@@ -116,14 +114,20 @@ class FrustumDataset(object):
 
         self.sample_buffer = Queue(maxsize=1024)
 
-        # roi_features of the first positive proposal, for generating proposal from label
-        self.roi_feature_ = {}
-
     def get_proposals(self, rpn_out):
         proposals = []
-        for ind in rpn_out['nms_indices']:
-            if ind == -1:
-                continue
+        if self.split == 'train':
+            nms_thres = 0.85
+            max_keep = 300
+        else:
+            nms_thres = 0.8
+            max_keep = 100
+        bev_boxes = []
+        for ry, center, size in zip(rpn_out['angles'], rpn_out['centers'], rpn_out['sizes']):
+            bev_boxes.append([center[0], center[2], size[0], size[2], 180*ry/np.pi])
+        bev_boxes = np.array(bev_boxes)
+        nms_idx = nms_rotate_cpu(bev_boxes, rpn_out['scores'], nms_thres, max_keep)
+        for ind in nms_idx:
             # to ProposalObject
             x,y,z = rpn_out['centers'][ind]
             l, h, w = rpn_out['sizes'][ind]
@@ -131,98 +135,37 @@ class FrustumDataset(object):
             proposal = ProposalObject(np.array([x,y,z,l, h, w, ry]))
             proposals.append(proposal)
         return proposals
-        # if data_idx in self.proposals:
-        #     return self.proposals[data_idx]
-        # else:
-        #     return []
 
     def load_split_ids(self, split):
         with open(os.path.join(self.kitti_path, split + '.txt')) as f:
             return [line.rstrip('\n') for line in f]
 
-    def preprocess(self):
-        start = time.time()
-        npoints = 0
-        obj_points = 0
-        pos_count = 0
-        neg_count = 0
-        recall = 0
-        has_obj_count = 0
-        avg_iou = []
-        type_count = {t: 0 for t in type_whitelist if t != 'NonObject'}
-        self._load_proposals('rpn_out_{0}.pkl'.format(self.split))
-        for frame_id in self.frame_ids:
-            frame_data = self.load_frame_data(frame_id)
-            for sample in frame_data['samples']:
-                if sample.cls_label != g_type2onehotclass['NonObject']:
-                    type_count[g_class2type[sample.cls_label]] += 1
-            if 'recall' in frame_data:
-                has_obj_count += 1
-                recall += frame_data['recall']
-            if 'avg_iou' in frame_data:
-                avg_iou += frame_data['avg_iou']
-            with open(os.path.join(self.save_dir, frame_id+'.pkl'), 'wb') as f:
-                pickle.dump(frame_data, f)
-            print('preprocess progress: {}/{}'.format(self.load_progress, len(self.frame_ids)))
-            for i in frame_data['pos_idxs']:
-                npoints += len(frame_data['samples'][i].seg_label)
-                obj_points += np.sum(frame_data['samples'][i].seg_label)
-            pos_count += len(frame_data['pos_idxs'])
-            neg_count += len(frame_data['samples']) - len(frame_data['pos_idxs'])
-        print('preprocess done, cost time: {}'.format(time.time() - start))
-        print('pos: {}, neg: {}'.format(pos_count, neg_count))
-        print('sample of each class: ', type_count)
-        print('recall: {}'.format(recall/has_obj_count))
-        print('Avg iou: {}'.format(np.mean(avg_iou)))
-        print('Avg points: {}, pos_ratio: {}'.format(npoints/pos_count, obj_points/npoints))
-
-    def group_overlaps(self, objs, calib, iou_thres=0.01):
-        bev_boxes = map(lambda obj: utils.compute_box_3d(obj, calib.P)[1][:4, [0,2]], objs)
-        groups = []
-        candidates = range(len(objs))
-        while len(candidates) > 0:
-            idx = candidates[0]
-            group = [idx]
-            for i in candidates[1:]:
-                if get_iou(bev_boxes[idx], bev_boxes[i]) >= iou_thres:
-                    group.append(i)
-            for j in group:
-                candidates.remove(j)
-            groups.append(map(lambda i: objs[i], group))
-            # groups.append(group)
-        return groups
-
-    def do_sampling(self, frame_data, pos_ratio=0.5, is_eval=False):
+    def do_sampling(self, frame_data, pos_ratio=0.5):
+        if not self.is_training:
+            return frame_data['samples']
         samples = frame_data['samples']
         pos_idxs = frame_data['pos_idxs']
         neg_idxs = [i for i in range(0, len(samples)) if i not in pos_idxs]
         random.shuffle(neg_idxs)
-        if is_eval:
-            need_neg = int(len(neg_idxs) * 0.5)
-            #need_neg = len(neg_idxs)
-            #need_neg = 1
-            keep_idxs = pos_idxs + neg_idxs[:need_neg]
-            #keep_idxs = pos_idxs
-        elif pos_ratio == 0.0:
+
+        if pos_ratio == 0.0:
             keep_idxs = neg_idxs
         elif pos_ratio == 1.0:
             keep_idxs = pos_idxs
         else:
+            '''
             cyclist_idxs = [i for i in pos_idxs if samples[i].cls_label == g_type2onehotclass['Cyclist']]
             pedestrian_idxs = [i for i in pos_idxs if samples[i].cls_label == g_type2onehotclass['Pedestrian']]
             car_idxs = [i for i in pos_idxs if samples[i].cls_label == g_type2onehotclass['Car']]
-            '''
             # downsample
             car_idxs = random.sample(car_idxs, int(len(car_idxs) * 0.5))
-            '''
             # oversample
             cyclist_idxs = cyclist_idxs * 10
             pedestrian_idxs = pedestrian_idxs * 5
             pos_idxs = car_idxs + cyclist_idxs + pedestrian_idxs
-
+            '''
             need_neg = int(len(pos_idxs) * ((1-pos_ratio)/pos_ratio))
             keep_idxs = pos_idxs + neg_idxs[:need_neg]
-            #keep_idxs = pos_idxs
         random.shuffle(keep_idxs)
         p = 0
         n = 0
@@ -233,7 +176,7 @@ class FrustumDataset(object):
                 n += 1
         kept_samples = [samples[i] for i in keep_idxs]
 
-        # data augmentation
+        # Data augmentation
         for sample in kept_samples:
             if self.random_flip:
                 sample.random_flip()
@@ -249,13 +192,13 @@ class FrustumDataset(object):
             item = self.sample_buffer.get()
             self.sample_buffer.task_done()
 
-    def load_buffer_repeatedly(self, pos_ratio=0.5, is_eval=False):
+    def load(self, pos_ratio=0.5):
         i = -1
         last_sample_id = None
         while not self.stop:
             frame_id = self.frame_ids[i]
             frame_data = self.load_frame_data(frame_id)
-            samples = self.do_sampling(frame_data, pos_ratio=pos_ratio, is_eval=is_eval)
+            samples = self.do_sampling(frame_data, pos_ratio=pos_ratio)
             for s in samples:
                 s.frame_id = frame_id
                 self.sample_buffer.put(s)
@@ -268,35 +211,41 @@ class FrustumDataset(object):
                 random.shuffle(self.frame_ids)
             i = (i + 1) % len(self.frame_ids)
 
-    def get_next_batch(self):
+    def get_next_batch(self, wait=True):
         is_last_batch = False
         samples = []
         for _ in range(self.batch_size):
-            sample = self.sample_buffer.get()
+            if not wait and self.sample_buffer.empty(): # stop if empty, for inference
+                is_last_batch = True
+                break
+            sample = self.sample_buffer.get() # block if empty, for training
             samples.append(sample)
             if sample.idx == self.last_sample_id:
                 is_last_batch = True
                 self.last_sample_id = None
                 break
 
-        bsize = len(samples) # note that bsize can be smaller than self.batch_size
-        batch_data = np.zeros((bsize, self.npoints, self.num_channel))
-        batch_cls_label = np.zeros((bsize,), dtype=np.int32)
-        batch_ious = np.zeros((bsize,), dtype=np.float32)
-        batch_label = np.zeros((bsize, self.npoints), dtype=np.int32)
-        batch_center = np.zeros((bsize, 3))
-        batch_heading_class = np.zeros((bsize,), dtype=np.int32)
-        batch_heading_residual = np.zeros((bsize,))
-        batch_size_class = np.zeros((bsize,), dtype=np.int32)
-        batch_size_residual = np.zeros((bsize, 3))
-        batch_rot_angle = np.zeros((bsize,))
-        batch_img_seg_map = np.zeros((bsize, 360, 1200, 4), dtype=np.float32)
-        batch_prop_box = np.zeros((bsize, 7), dtype=np.float32)
-        batch_calib = np.zeros((bsize, 3, 4), dtype=np.float32)
-        #batch_feature_vec = np.zeros((bsize, 3136))
-        frame_ids = []
-        batch_proposal_score = np.zeros((bsize,), dtype=np.float32)
-        for i in range(bsize):
+        batch_size = self.batch_size
+        avail_num = len(samples) # note that avail_num can be smaller than self.batch_size
+        # may pad the remaining with zero
+        batch_data = {
+            'ids': [],
+            'pointcloud': np.zeros((batch_size, self.npoints, self.num_channel)),
+            'cls_label': np.zeros((batch_size,), dtype=np.int32),
+            'ious': np.zeros((batch_size,), dtype=np.float32),
+            'seg_label': np.zeros((batch_size, self.npoints), dtype=np.int32),
+            'center': np.zeros((batch_size, 3)),
+            'heading_class': np.zeros((batch_size,), dtype=np.int32),
+            'heading_residual': np.zeros((batch_size,)),
+            'size_class': np.zeros((batch_size,), dtype=np.int32),
+            'size_residual': np.zeros((batch_size, 3)),
+            'rot_angle': np.zeros((batch_size,)),
+            'img_seg_map': np.zeros((batch_size, 360, 1200, 4), dtype=np.float32),
+            'prop_box': np.zeros((batch_size, 7), dtype=np.float32),
+            'proposal_score': np.zeros((batch_size,), dtype=np.float32),
+            'calib': np.zeros((batch_size, 3, 4), dtype=np.float32)
+        }
+        for i in range(avail_num):
             sample = samples[i]
             assert(sample.point_set.shape[0] == sample.seg_label.shape[0])
             if sample.point_set.shape[0] == 0:
@@ -307,32 +256,22 @@ class FrustumDataset(object):
                 choice = np.random.choice(sample.point_set.shape[0], self.npoints, replace=True)
                 point_set = sample.point_set[choice, 0:self.num_channel]
                 seg_label = sample.seg_label[choice]
-            box3d_center = copy.deepcopy(sample.box3d_center)
-            # Data Augmentation
-            if self.random_shift:
-                dist = np.sqrt(np.sum(box3d_center[0]**2+box3d_center[1]**2))
-                shift = np.clip(np.random.randn()*dist*0.05, dist*0.8, dist*1.2)
-                point_set[:,2] += shift
-                box3d_center[2] += shift
-            batch_data[i,...] = point_set
-            batch_center[i,:] = box3d_center
-            batch_cls_label[i] = sample.cls_label
-            batch_ious[i] = sample.iou
-            batch_label[i,:] = seg_label
-            batch_heading_class[i] = sample.angle_class
-            batch_heading_residual[i] = sample.angle_residual
-            batch_size_class[i] = sample.size_class
-            batch_size_residual[i] = sample.size_residual
-            batch_rot_angle[i] = sample.rot_angle
-            batch_img_seg_map[i] = sample.img_seg_map
-            frame_ids.append(sample.frame_id)
-            batch_proposal_score[i] = sample.proposal.score
-            batch_prop_box[i] = sample.prop_box
-            batch_calib[i] = sample.calib
-        return batch_data, batch_cls_label, batch_ious, batch_label, batch_center, \
-            batch_heading_class, batch_heading_residual, \
-            batch_size_class, batch_size_residual, \
-            batch_rot_angle, batch_img_seg_map, batch_prop_box, batch_calib, frame_ids, batch_proposal_score, is_last_batch
+            batch_data['ids'].append(sample.frame_id)
+            batch_data['pointcloud'][i,...] = point_set
+            batch_data['cls_label'][i] = sample.cls_label
+            batch_data['ious'][i] = sample.iou
+            batch_data['seg_label'][i,:] = seg_label
+            batch_data['center'][i,:] = sample.box3d_center
+            batch_data['heading_class'][i] = sample.angle_class
+            batch_data['heading_residual'][i] = sample.angle_residual
+            batch_data['size_class'][i] = sample.size_class
+            batch_data['size_residual'][i] = sample.size_residual
+            batch_data['rot_angle'][i] = sample.rot_angle
+            batch_data['img_seg_map'][i] = sample.img_seg_map
+            batch_data['prop_box'][i] = sample.prop_box
+            batch_data['proposal_score'][i] = sample.proposal.score
+            batch_data['calib'][i] = sample.calib
+        return batch_data, is_last_batch
 
     def get_center_view_rot_angle(self, frustum_angle):
         ''' Get the frustum rotation angle, it isshifted by pi/2 so that it
@@ -365,6 +304,12 @@ class FrustumDataset(object):
             print('skip proposal behind camera')
             return False
         # get points within proposal box
+        # expand proposal
+        proposal_expand = copy.deepcopy(proposal)
+        proposal_expand.l += 0.5
+        proposal_expand.w += 0.5
+        proposal_expand.h += 0.5
+        _, prop_corners_3d = utils.compute_box_3d(proposal_expand, calib.P)
         _,prop_inds = extract_pc_in_box3d(pc_rect, prop_corners_3d)
         pc_in_prop_box = pc_rect[prop_inds,:]
         seg_mask = np.zeros((pc_in_prop_box.shape[0]))
@@ -373,16 +318,8 @@ class FrustumDataset(object):
             return False
 
         # Get frustum angle
-        image_points = calib.project_rect_to_image(pc_in_prop_box[:,:3])
-        expand_image_points = np.concatenate((prop_corners_image_2d, image_points), axis=0)
-        xmin, ymin = expand_image_points.min(0)
-        xmax, ymax = expand_image_points.max(0)
-        # TODO: frustum angle is important, make use of image
-        # use gt angle for testing
-        # if gt_object is not None:
-        #     xmin,ymin,xmax,ymax = gt_object.box2d
+        box2d_center = calib.project_rect_to_image(np.array([proposal.t]))[0]
 
-        box2d_center = np.array([(xmin+xmax)/2.0, (ymin+ymax)/2.0])
         uvdepth = np.zeros((1,3))
         uvdepth[0,0:2] = box2d_center
         uvdepth[0,2] = 20 # some random depth
@@ -468,11 +405,11 @@ class FrustumDataset(object):
         mlab.plot3d([0, box2d_center_rect[0][0]], [0, box2d_center_rect[0][1]], [0, box2d_center_rect[0][2]], color=(1,1,1), tube_radius=None, figure=fig)
         raw_input()
 
-    def get_proposals_from_label(self, labels, calib):
+    def get_proposals_from_label(self, labels, calib, augmentX):
         '''construct proposal from label'''
         proposals = []
         for label in labels:
-            for _ in range(self.augmentX):
+            for _ in range(augmentX):
                 prop = ProposalObject(list(label.t) + [label.l, label.h, label.w, label.ry], 1.0, label.type, None)
                 prop = random_shift_box3d(prop)
                 proposals.append(prop)
@@ -490,20 +427,20 @@ class FrustumDataset(object):
         fig = draw_gt_boxes3d(gt_boxes, fig, draw_text=False, color=(1, 1, 1))
         raw_input()
 
-    def load_frame_data(self, data_idx_str):
-        '''load data for the first time'''
-        start = time.time()
+    def load_frame_data(self, data_idx_str, rpn_out=None, img_seg_map=None):
         data_idx = int(data_idx_str)
-        try:
-            with open(os.path.join(self.data_dir, data_idx_str+'.pkl'), 'rb') as fin:
-                rpn_out = pickle.load(fin)
-            # load image segmentation output
-            img_seg_map = np.load(os.path.join(self.data_dir, data_idx_str+'_seg.npy'))
-        except Exception as e:
-            print(e)
-            return {'samples': [], 'pos_idxs': []}
+        # rpn out and img_seg_map can be directly provided
+        if rpn_out is None or img_seg_map is None:
+            try:
+                with open(os.path.join(self.data_dir, data_idx_str+'.pkl'), 'rb') as fin:
+                    rpn_out = pickle.load(fin)
+                # load image segmentation output
+                img_seg_map = np.load(os.path.join(self.data_dir, data_idx_str+'_seg.npy'))
+            except Exception as e:
+                print(e)
+                return {'samples': [], 'pos_idxs': []}
+        start = time.time()
         calib = self.kitti_dataset.get_calibration(data_idx) # 3 by 4 matrix
-        objects = self.kitti_dataset.get_label_objects(data_idx)
         image = self.kitti_dataset.get_image(data_idx)
         pc_velo = self.kitti_dataset.get_lidar(data_idx)
         img_height, img_width = image.shape[0:2]
@@ -520,6 +457,10 @@ class FrustumDataset(object):
         pc_rect[:,3] = pc_velo[:,3]
         gt_boxes_xy = []
         gt_boxes_3d = []
+        if self.is_training:
+            objects = self.kitti_dataset.get_label_objects(data_idx)
+        else:
+            objects = []
         objects = filter(lambda obj: obj.type in type_whitelist, objects)
         for obj in objects:
             _, gt_corners_3d = utils.compute_box_3d(obj, calib.P)
@@ -528,9 +469,13 @@ class FrustumDataset(object):
         recall = np.zeros((len(objects),))
 
         if self.use_gt_prop:
-            proposals = self.get_proposals_from_label(objects, calib)
+            assert(self.is_training==True)
+            proposals = self.get_proposals_from_label(objects, calib, self.augmentX)
         else:
             proposals = self.get_proposals(rpn_out)
+            # add more training samples
+            #if self.split == 'train':
+            #    proposals += self.get_proposals_from_label(objects, calib, 1)
 
         samples = []
         pos_idxs = []
@@ -543,7 +488,13 @@ class FrustumDataset(object):
             if prop_corners_image_2d is None:
                 # print('skip proposal behind camera')
                 continue
-
+            # testing
+            if not self.is_training:
+                sample = self.get_one_sample(prop, pc_rect, image, calib, -1, None, None, data_idx_str, img_seg_map)
+                if sample:
+                    samples.append(sample)
+                continue
+            # training
             prop_box_xy = prop_corners_3d[:4, [0,2]]
             # find corresponding label object
             obj_idx, iou_with_gt = self.find_match_label(prop_box_xy, gt_boxes_xy)
@@ -556,11 +507,9 @@ class FrustumDataset(object):
                 if sample:
                     samples.append(sample)
                     neg_box.append(prop_corners_3d)
-            elif iou_with_gt >= 0.5 \
-                or (iou_with_gt >= 0.45 and objects[obj_idx].type in ['Pedestrian', 'Cyclist']):
+            elif iou_with_gt >= 0.6 \
+                or (iou_with_gt >= 0.5 and objects[obj_idx].type in ['Pedestrian', 'Cyclist']):
                 obj_type = objects[obj_idx].type
-                if self.roi_feature_.get(obj_type) is None:
-                    self.roi_feature_[obj_type] = prop_.roi_features
                 avg_iou.append(iou_with_gt)
 
                 sample = self.get_one_sample(prop, pc_rect, image, calib, iou_with_gt, gt_boxes_3d[obj_idx], objects[obj_idx], data_idx_str, img_seg_map)
@@ -581,6 +530,7 @@ class FrustumDataset(object):
             ret['recall'] = np.sum(recall)/len(objects)
         if len(pos_idxs) > 0:
             ret['avg_iou'] = avg_iou
+        #print('load frame data cost: ', time.time() - start)
         return ret
 
     def find_match_label(self, prop_corners, labels_corners):
@@ -616,14 +566,15 @@ if __name__ == '__main__':
     else:
         augmentX = 1
         use_gt_prop = False
-    dataset = FrustumDataset(512, kitti_path, 16, split, save_dir='./dataset_car_people/'+split,
+    dataset = FrustumDataset(512, kitti_path, 16, split, data_dir='./rcnn_data_'+split,
                  augmentX=augmentX, random_shift=True, rotate_to_center=True, random_flip=True,
                  use_gt_prop=use_gt_prop)
-    #dataset.preprocess()
-    # dataset.load_buffer_repeatedly(0.5)
+    #dataset.load(0.5)
+    dataset.load_frame_data('000001')
+    dataset.get_next_batch(wait=False)
 
     '''
-    produce_thread = threading.Thread(target=dataset.load_buffer_repeatedly, args=(1.0,))
+    produce_thread = threading.Thread(target=dataset.load, args=(1.0,))
     produce_thread.start()
 
     while(True):

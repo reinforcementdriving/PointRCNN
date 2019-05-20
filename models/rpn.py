@@ -11,7 +11,7 @@ sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(ROOT_DIR, 'utils'))
 import tf_util
 from pointnet_util import pointnet_sa_module, pointnet_sa_module_msg, pointnet_fp_module
-from model_util import point_cloud_masking, get_box3d_corners_helper, focal_loss, huber_loss
+from model_util import point_cloud_masking, get_box3d_corners_helper, focal_loss, huber_loss, SigmoidFocalClassificationLoss
 from model_util import NUM_FG_POINT
 from box_encoder import NUM_SIZE_CLUSTER, type_mean_size
 from box_encoder import BoxEncoder
@@ -23,7 +23,6 @@ NUM_HEADING_BIN = 12
 NUM_CENTER_BIN = 12
 CENTER_SEARCH_RANGE = 3.0
 HEADING_SEARCH_RANGE = np.pi
-NUM_CHANNEL = 4
 NUM_SEG_CLASSES = 2
 
 class RPN(object):
@@ -158,7 +157,10 @@ class RPN(object):
             end_points: dict
         '''
         l0_xyz = tf.slice(point_cloud, [0,0,0], [-1,-1,3])
-        l0_points = tf.slice(point_cloud, [0,0,3], [-1,-1,NUM_CHANNEL-3])
+        if self.num_channel > 3:
+            l0_points = tf.slice(point_cloud, [0,0,3], [-1,-1,self.num_channel-3])
+        else:
+            l0_points = None
 
         # Set abstraction layers
         l1_xyz, l1_points = pointnet_sa_module_msg(l0_xyz, l0_points,
@@ -191,12 +193,12 @@ class RPN(object):
         end_points['point_feats'] = tf.concat([l0_xyz,l0_points], axis=-1) # (B, N, 3+C1)
         #end_points['point_feats_fuse'] = tf.concat([end_points['point_feats'], end_points['point_img_feats']], axis=-1) # (B, N, 3+C1+C2)
         #semantic_features = tf.concat([l0_points, end_points['point_img_feats']], axis=-1) # (B, N, C1+C2)
-        end_points['point_feats_fuse'] = end_points['point_feats']
+        #end_points['point_feats_fuse'] = end_points['point_feats']
         semantic_features = l0_points
         # FC layers
         net = tf_util.conv1d(semantic_features, 128, 1, padding='VALID', bn=True,
             is_training=is_training, scope='conv1d-fc1', bn_decay=bn_decay)
-        net = tf_util.dropout(net, keep_prob=0.7,
+        net = tf_util.dropout(net, keep_prob=0.5,
             is_training=is_training, scope='dp1')
         logits = tf_util.conv1d(net, NUM_SEG_CLASSES, 1,
             padding='VALID', activation_fn=None, scope='conv1d-fc2')
@@ -241,28 +243,19 @@ class RPN(object):
     def get_region_proposal_net(self, point_feats, is_training, bn_decay, end_points):
         batch_size = point_feats.get_shape()[0].value
         npoints = point_feats.get_shape()[1].value
+        # xyz is not used
         point_feats = tf.slice(point_feats, [0,0,3], [-1,-1,-1]) # (B, N, D)
-        net = tf.reshape(point_feats, [batch_size * npoints, -1])
-        # Fully connected layers
-        net = tf_util.fully_connected(net, 256, bn=True,
-            is_training=is_training, scope='rp-fc0', bn_decay=bn_decay)
-        #net = tf_util.dropout(net, keep_prob=0.7,
-        #    is_training=is_training, scope='rp-dp0')
-        net = tf_util.fully_connected(net, 256, bn=True,
-            is_training=is_training, scope='rp-fc1', bn_decay=bn_decay)
-        #net = tf_util.dropout(net, keep_prob=0.7,
-        #    is_training=is_training, scope='rp-dp1')
-        net = tf_util.fully_connected(net, 512, bn=True,
-            is_training=is_training, scope='rp-fc2', bn_decay=bn_decay)
-        #net = tf_util.dropout(net, keep_prob=0.7,
+        # FC layers
+        net = tf_util.conv1d(point_feats, 256, 1, padding='VALID', bn=True,
+            is_training=is_training, scope='rp-conv1d-fc1', bn_decay=bn_decay)
+        net = tf_util.dropout(net, keep_prob=0.5,
+            is_training=is_training, scope='rp-dp1')
+        #net = tf_util.conv1d(net, 256, 1, padding='VALID', bn=True,
+        #    is_training=is_training, scope='rp-conv1d-fc2', bn_decay=bn_decay)
+        #net = tf_util.dropout(net, keep_prob=0.5,
         #    is_training=is_training, scope='rp-dp2')
-        # The first NUM_CENTER_BIN*2*2: CENTER_BIN class scores and bin residuals for (x,z)
-        # next 1: center residual for y
-        # next NUM_HEADING_BIN*2: heading bin class scores and residuals
-        # next NUM_SIZE_CLUSTER*4: size cluster class scores and residuals(l,w,h)
-        output = tf_util.fully_connected(net,
-            NUM_CENTER_BIN*2*2+1+NUM_HEADING_BIN*2+NUM_SIZE_CLUSTER*4,
-            activation_fn=None, scope='rp-fc3')
+        output = tf_util.conv1d(net, NUM_CENTER_BIN*2*2+1+NUM_HEADING_BIN*2+NUM_SIZE_CLUSTER*4, 1,
+            padding='VALID', activation_fn=None, scope='rp-conv1d-fc-out')
         end_points['proposals'] = output
         return output
 
@@ -279,7 +272,7 @@ class RPN(object):
         #end_points['point_feats_fuse'] = tf.concat([end_points['point_feats_fuse'], seg_logits], axis=-1)
         # fg_point_feats include xyz
         fg_point_feats, end_points = point_cloud_masking(
-            end_points['point_feats_fuse'], seg_logits,
+            end_points['point_feats'], seg_logits,
             end_points, xyz_only=False) # BxNUM_FG_POINTxD
         proposals = self.get_region_proposal_net(fg_point_feats, is_training, bn_decay, end_points)
         proposals_reshaped = tf.reshape(proposals, [self.batch_size, NUM_FG_POINT, -1])
@@ -295,8 +288,14 @@ class RPN(object):
         pls = self.placeholders
         end_points = self.end_points
         batch_size = self.batch_size
+        num_point = self.num_point
         # 3D Segmentation loss
-        mask_loss = focal_loss(end_points['foreground_logits'], tf.one_hot(pls['seg_labels'], NUM_SEG_CLASSES, axis=-1))
+        #mask_loss = focal_loss(end_points['foreground_logits'], tf.one_hot(pls['seg_labels'], NUM_SEG_CLASSES, axis=-1))
+        focal_loss = SigmoidFocalClassificationLoss()
+        mask_weights = tf.tile(tf.constant([[[1, 15]]], dtype=tf.float32), [batch_size, num_point, 1])
+        pos_normalizer = tf.maximum(tf.reduce_sum(tf.cast(pls['seg_labels']>0, tf.float32)), 1)
+        mask_weights = mask_weights / pos_normalizer
+        mask_loss = focal_loss._compute_loss(end_points['foreground_logits'], tf.one_hot(pls['seg_labels'], NUM_SEG_CLASSES, axis=-1), mask_weights)
         tf.summary.scalar('mask loss', mask_loss)
         #return mask_loss, {}
         # gather box estimation labels of foreground points
@@ -322,16 +321,16 @@ class RPN(object):
         # NOTICE: labels['center_x_residuals'] is already normalized
         center_x_residuals_normalized = tf.reduce_sum(end_points['center_x_residuals_normalized']*tf.to_float(bin_x_onehot), axis=2) # BxN
         center_x_residuals_dist = tf.norm(labels_fg['center_x_residuals_labels'] - center_x_residuals_normalized, axis=-1)
-        center_x_res_loss = huber_loss(center_x_residuals_dist, delta=2.0)
+        center_x_res_loss = huber_loss(center_x_residuals_dist, delta=1.0)
         bin_z_onehot = tf.one_hot(labels_fg['center_bin_z_labels'],
             depth=NUM_CENTER_BIN,
             on_value=1, off_value=0, axis=-1) # BxNxNUM_CENTER_BIN
         center_z_residuals_normalized = tf.reduce_sum(end_points['center_z_residuals_normalized']*tf.to_float(bin_z_onehot), axis=2) # BxN
         center_z_residuals_dist = tf.norm(labels_fg['center_z_residuals_labels'] - center_z_residuals_normalized, axis=-1)
-        center_z_res_loss = huber_loss(center_z_residuals_dist, delta=2.0)
+        center_z_res_loss = huber_loss(center_z_residuals_dist, delta=1.0)
         # y is directly regressed
         center_y_residuals_dist = tf.norm(labels_fg['center_y_residuals_labels'] - tf.gather(end_points['center_y_residuals'], 0, axis=-1), axis=-1)
-        center_y_res_loss = huber_loss(center_y_residuals_dist, delta=2.0)
+        center_y_res_loss = huber_loss(center_y_residuals_dist, delta=1.0)
         tf.summary.scalar('center_x  class loss', center_x_cls_loss)
         tf.summary.scalar('center_z  class loss', center_z_cls_loss)
         tf.summary.scalar('center_x residual loss', center_x_res_loss)
@@ -370,12 +369,12 @@ class RPN(object):
         tf.summary.scalar('size class loss', size_class_loss)
         tf.summary.scalar('size residual loss', size_res_loss)
 
-        seg_weight = 0.1
-        cls_weight = 10
-        res_weight = 10
+        seg_weight = 1
+        cls_weight = 1
+        res_weight = 1
         total_loss = seg_weight * mask_loss + \
             cls_weight * (center_x_cls_loss + center_z_cls_loss + heading_class_loss + size_class_loss) + \
-            res_weight * (center_x_res_loss + center_z_res_loss + center_y_res_loss + heading_res_loss + size_res_loss)
+            res_weight * (0.1*center_x_res_loss + 0.1*center_z_res_loss + 0.1*center_y_res_loss + 0.1*heading_res_loss + size_res_loss)
         loss_endpoints = {
             'size_class_loss': size_class_loss,
             'size_res_loss': size_res_loss,

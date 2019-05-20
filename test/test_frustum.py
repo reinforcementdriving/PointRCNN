@@ -1,9 +1,6 @@
 ''' Evaluating Frustum PointNets.
 Write evaluation results to KITTI format labels.
 and [optionally] write results to pickle files.
-
-Author: Charles R. Qi
-Date: September 2017
 '''
 from __future__ import print_function
 
@@ -31,40 +28,14 @@ from kitti_object import *
 import kitti_util as utils
 from frustum_pointnets_v2 import FrustumPointNet
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--gpu', type=int, default=0, help='GPU to use [default: GPU 0]')
-parser.add_argument('--num_point', type=int, default=1024, help='Point Number [default: 1024]')
-parser.add_argument('--model', default='frustum_pointnets_v1', help='Model name [default: frustum_pointnets_v1]')
-parser.add_argument('--model_path', default='log/model.ckpt', help='model checkpoint file path [default: log/model.ckpt]')
-parser.add_argument('--batch_size', type=int, default=32, help='batch size for inference [default: 32]')
-parser.add_argument('--output', default='test_results', help='output file/folder name [default: test_results]')
-parser.add_argument('--kitti_path', default='/data/ssd/public/jlliu/Kitti/object', help='Kitti root path')
-parser.add_argument('--split', default='val', help='Data split to use [default: val]')
-# parser.add_argument('--from_rgb_detection', action='store_true', help='test from dataset files from rgb detection.')
-parser.add_argument('--idx_path', default=None, help='filename of txt where each line is a data idx, used for rgb detection -- write <id>.txt for all frames. [default: None]')
-parser.add_argument('--dump_result', action='store_true', help='If true, also dump results to .pickle file')
-FLAGS = parser.parse_args()
 
-# Set training configurations
-BATCH_SIZE = FLAGS.batch_size
-MODEL_PATH = FLAGS.model_path
-GPU_INDEX = FLAGS.gpu
-NUM_POINT = FLAGS.num_point
-# NUM_CLASSES = 2
-
-TEST_DATASET = FrustumDataset(NUM_POINT, FLAGS.kitti_path, BATCH_SIZE, FLAGS.split,
-             data_dir='./rcnn_data_'+FLAGS.split,
-             augmentX=1, random_shift=False, rotate_to_center=True, random_flip=False, use_gt_prop=False)
-
-kitti_dataset = TEST_DATASET.kitti_dataset
-
-def get_session_and_model():
+def get_session_and_model(batch_size, num_point):
     ''' Define model graph, load model parameters,
     create session and return session handle and tensors
     '''
     with tf.Graph().as_default():
         with tf.device('/gpu:'+str(GPU_INDEX)):
-            frustum_pointnet = FrustumPointNet(BATCH_SIZE, NUM_POINT)
+            frustum_pointnet = FrustumPointNet(batch_size, num_point)
             placeholders = frustum_pointnet.placeholders
             end_points = frustum_pointnet.end_points
             saver = tf.train.Saver()
@@ -88,7 +59,7 @@ def softmax(x):
 
 def inference(sess, model, pc, img_seg_map, prop_box, calib, cls_label):
     ''' Run inference for frustum pointnets in batch mode '''
-    assert pc.shape[0] == BATCH_SIZE
+    #assert pc.shape[0] == BATCH_SIZE
 
     ep = model.end_points
     pls = model.placeholders
@@ -145,16 +116,10 @@ class DetectObject(object):
         self.box_2d = box_2d
         self.box_3d = box_3d # corners
 
-calib_cache = {}
-def get_calibration(idx):
-    if idx not in calib_cache:
-        calib_cache[idx] = kitti_dataset.get_calibration(idx)
-    return calib_cache[idx]
-
 def to_detection_objects(id_list, type_list, center_list, \
                         heading_cls_list, heading_res_list, \
                         size_cls_list, size_res_list, \
-                        rot_angle_list, score_list, prob_list, proposal_score_list):
+                        rot_angle_list, score_list, prob_list, proposal_score_list, dataset):
     objects = {}
     for i in range(len(center_list)):
         if type_list[i] == 'NonObject':
@@ -167,7 +132,7 @@ def to_detection_objects(id_list, type_list, center_list, \
             size_cls_list[i], size_res_list[i], rot_angle_list[i])
         obj = DetectObject(h,w,l,tx,ty,tz,ry,idx,type_list[i],score)
         # cal 2d box from 3d box
-        calib = get_calibration(idx)
+        calib = dataset.kitti_dataset.get_calibration(idx)
         box3d_pts_2d, box3d_pts_3d = utils.compute_box_3d(obj, calib.P)
         if box3d_pts_2d is None:
             continue
@@ -238,11 +203,11 @@ def group_overlaps(detections, calib, iou_thres=0.01):
         groups.append(map(lambda i: detections[i], group))
     return groups
 
-def nms_on_bev(objects, iou_threshold=0.1):
+def nms_on_bev(objects, dataset, iou_threshold=0.1):
     final_result = {}
     for frame_id, detections in objects.items():
         final_result[frame_id] = []
-        calib = get_calibration(int(frame_id))
+        calib = dataset.kitti_dataset.get_calibration(int(frame_id))
         #detections = filter(lambda d: d.score > np.log(0.5**4) and d.probs[2] >= 0.3, detections)
         groups = group_overlaps(detections, calib, iou_threshold)
         for group in groups:
@@ -252,15 +217,18 @@ def nms_on_bev(objects, iou_threshold=0.1):
             final_result[frame_id].append(keep)
     return final_result
 
-def test(output_filename, result_dir=None):
+def test(TEST_DATASET, output_filename, result_dir=None):
     ''' Test frustum pointents with 2D boxes from a RGB detector.
     Write test results to KITTI format label files.
     todo (rqi): support variable number of points.
     '''
-    val_loading_thread = Thread(target=TEST_DATASET.load_buffer_repeatedly, args=(0.5, True))
+    val_loading_thread = Thread(target=TEST_DATASET.load)
     val_loading_thread.start()
 
-    ps_list = []
+    batch_size = TEST_DATASET.batch_size
+    num_point = TEST_DATASET.npoints
+
+    #ps_list = []
     cls_list = []
     center_list = []
     heading_cls_list = []
@@ -277,14 +245,17 @@ def test(output_filename, result_dir=None):
     total_fp = 0
     total_fn = 0
 
-    sess, model = get_session_and_model()
+    sess, model = get_session_and_model(batch_size, num_point)
     # for batch_idx in range(num_batches):
     batch_idx = 0
-    # TODO: return frame_id_list in get_next_batch
     while(True):
         batch_data, is_last_batch = TEST_DATASET.get_next_batch()
         print('batch idx: %d' % (batch_idx))
         batch_idx += 1
+
+        # FIXME: will discard last batch if it has less samples than batch size
+        if len(batch_data['ids']) != batch_size:
+            break
 
         # Run one batch inference
     	batch_cls, batch_center_pred, \
@@ -302,19 +273,19 @@ def test(output_filename, result_dir=None):
         if total_tp+total_fn > 0 and total_tp+total_fp > 0:
             print('average recall: {}, precision: {}'.format(float(total_tp)/(total_tp+total_fn), float(total_tp)/(total_tp+total_fp)))
 
-        for i in range(BATCH_SIZE):
-            ps_list.append(batch_data[i,...])
+        for i in range(batch_size):
+            #ps_list.append(batch_data[i,...])
             cls_list.append(batch_cls[i,...])
             center_list.append(batch_center_pred[i,:])
             heading_cls_list.append(batch_hclass_pred[i])
             heading_res_list.append(batch_hres_pred[i])
             size_cls_list.append(batch_sclass_pred[i])
             size_res_list.append(batch_sres_pred[i,:])
-            rot_angle_list.append(batch_rot_angle[i])
+            rot_angle_list.append(batch_data['rot_angle'][i])
             score_list.append(batch_scores[i])
             prob_list.append(batch_prob[i])
-            proposal_score_list.append(batch_proposal_score[i])
-        frame_id_list += map(lambda fid: int(fid), batch_frame_ids)
+            proposal_score_list.append(batch_data['proposal_score'][i])
+        frame_id_list += map(lambda fid: int(fid), batch_data['ids'])
         if is_last_batch:
             break
 
@@ -323,11 +294,11 @@ def test(output_filename, result_dir=None):
     detection_objects = to_detection_objects(frame_id_list, type_list,
         center_list, heading_cls_list, heading_res_list,
         size_cls_list, size_res_list, rot_angle_list, score_list, prob_list,
-        proposal_score_list)
+        proposal_score_list, TEST_DATASET)
     if FLAGS.dump_result:
         with open(output_filename, 'wp') as fp:
             pickle.dump(detection_objects, fp)
-    detection_objects = nms_on_bev(detection_objects, 0.01)
+    detection_objects = nms_on_bev(detection_objects, TEST_DATASET, 0.1)
     # Write detection results for KITTI evaluation
     write_detection_results(result_dir, detection_objects)
     output_dir = os.path.join(result_dir, 'data')
@@ -341,4 +312,28 @@ def test(output_filename, result_dir=None):
     val_loading_thread.join()
 
 if __name__=='__main__':
-    test(FLAGS.output+'.pickle', FLAGS.output)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu', type=int, default=0, help='GPU to use [default: GPU 0]')
+    parser.add_argument('--num_point', type=int, default=1024, help='Point Number [default: 1024]')
+    parser.add_argument('--model', default='frustum_pointnets_v1', help='Model name [default: frustum_pointnets_v1]')
+    parser.add_argument('--model_path', default='log/model.ckpt', help='model checkpoint file path [default: log/model.ckpt]')
+    parser.add_argument('--batch_size', type=int, default=32, help='batch size for inference [default: 32]')
+    parser.add_argument('--output', default='test_results', help='output file/folder name [default: test_results]')
+    parser.add_argument('--kitti_path', default='/data/ssd/public/jlliu/Kitti/object', help='Kitti root path')
+    parser.add_argument('--split', default='val', help='Data split to use [default: val]')
+    # parser.add_argument('--from_rgb_detection', action='store_true', help='test from dataset files from rgb detection.')
+    parser.add_argument('--idx_path', default=None, help='filename of txt where each line is a data idx, used for rgb detection -- write <id>.txt for all frames. [default: None]')
+    parser.add_argument('--dump_result', action='store_true', help='If true, also dump results to .pickle file')
+    FLAGS = parser.parse_args()
+
+    # Set training configurations
+    BATCH_SIZE = FLAGS.batch_size
+    MODEL_PATH = FLAGS.model_path
+    GPU_INDEX = FLAGS.gpu
+    NUM_POINT = FLAGS.num_point
+
+    TEST_DATASET = FrustumDataset(NUM_POINT, FLAGS.kitti_path, BATCH_SIZE, FLAGS.split,
+                 data_dir='./rcnn_data_'+FLAGS.split, is_training=False,
+                 augmentX=1, random_shift=False, rotate_to_center=True, random_flip=False, use_gt_prop=False)
+
+    test(TEST_DATASET, FLAGS.output+'.pickle', FLAGS.output)
